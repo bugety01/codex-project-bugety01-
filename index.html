@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>8-bit Inspired Platformer</title>
+  <style>
+    body {
+      margin: 0;
+      background: #0e0e10;
+      color: #e9e9f0;
+      font-family: "Trebuchet MS", Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      padding: 12px;
+    }
+    canvas {
+      border: 2px solid #333;
+      background: #1b1b20;
+      image-rendering: pixelated;
+    }
+    #hud {
+      width: 960px;
+      display: flex;
+      justify-content: space-between;
+      font-weight: 600;
+    }
+    #help {
+      width: 960px;
+      background: #16161a;
+      padding: 8px;
+      border: 1px solid #333;
+      border-radius: 4px;
+      line-height: 1.4;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <h1>8-bit Inspired Tutorial Stage</h1>
+  <div id="hud">
+    <div id="status">Coins: 0</div>
+    <div id="message"></div>
+  </div>
+  <canvas id="game" width="960" height="240"></canvas>
+  <div id="help">
+    Controls: Left/Right or A/D to run, Space/Up/W to jump. Bounce on enemies to defeat them. Reach the flag to win. Falling off-screen or touching an enemy hurts you and restarts at the last checkpoint (spawn).
+  </div>
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const messageEl = document.getElementById('message');
+
+    const TILE = 16;
+    const GRAVITY = 0.5;
+    const FRICTION = 0.85;
+    const ACCEL = 0.5;
+    const MAX_RUN = 3.5;
+    const JUMP_VELOCITY = -10;
+    const WORLD_HEIGHT = 15;
+    const WORLD_WIDTH = 200;
+
+    const LEVEL_MAP = `
+........................................................................................................................................................................................................
+........................................................................................................................................................................................................
+........................................................................................................................................................................................................
+........................................................................................................................................................................................................
+........................................................................................................................................................................................................
+........................................................................................................................................................................................................
+........................................................................................................................................................................................................
+................................................C.......................................................................................................................................................
+....................B.........................C...C.......................................................................................BBBB..............................C.C.........................
+...................?.........................C.......C..???......................................................................................................PP........C.....C.....................F.
+..........CCCCCC................................................................................................................................................PP................C.................####
+................................................................................PP..................C.C.C.C.C.............######......................######....PP..............................########
+...S....................................G.......................................PP........G.............................##########.........................G....PP..........................############
+############################...#################################################PP####################################################################......####PP######################################
+############################...#################################################PP####################################################################......####PP######################################
+`.trim().split('\n');
+
+    function validateLevel(mapRows) {
+      if (mapRows.length !== WORLD_HEIGHT) {
+        throw new Error(`Level must be ${WORLD_HEIGHT} rows high.`);
+      }
+      mapRows.forEach((row, i) => {
+        if (row.length !== WORLD_WIDTH) {
+          throw new Error(`Row ${i} is ${row.length} wide; expected ${WORLD_WIDTH}.`);
+        }
+      });
+    }
+
+    function createLevel(mapRows) {
+      validateLevel(mapRows);
+      const level = mapRows.map(r => r.split(''));
+      let spawn = { x: 0, y: 0 };
+      let flag = { x: 0, y: 0 };
+      const coins = [];
+      const enemies = [];
+
+      for (let y = 0; y < level.length; y++) {
+        for (let x = 0; x < level[y].length; x++) {
+          const ch = level[y][x];
+          if (ch === 'S') {
+            spawn = { x: x * TILE + 1, y: y * TILE };
+            level[y][x] = '.';
+          } else if (ch === 'C') {
+            coins.push({ x: x * TILE + 4, y: y * TILE + 4, collected: false });
+            level[y][x] = '.';
+          } else if (ch === 'G') {
+            enemies.push(createEnemy(x * TILE, y * TILE));
+            level[y][x] = '.';
+          } else if (ch === 'F') {
+            flag = { x: x * TILE, y: y * TILE };
+            level[y][x] = '.';
+          }
+        }
+      }
+      return { level, spawn, coins, enemies, flag };
+    }
+
+    function createEnemy(x, y) {
+      return {
+        x,
+        y,
+        w: 14,
+        h: 14,
+        vx: -1,
+        vy: 0,
+        alive: true,
+      };
+    }
+
+    let baseMap = LEVEL_MAP.slice();
+    let { level, spawn, coins, enemies, flag } = createLevel(baseMap);
+
+    const player = {
+      x: spawn.x,
+      y: spawn.y,
+      w: 14,
+      h: 16,
+      vx: 0,
+      vy: 0,
+      onGround: false,
+      coins: 0,
+      dead: false,
+      won: false,
+    };
+
+    let camera = { x: 0, y: 0 };
+    const keys = new Set();
+
+    document.addEventListener('keydown', (e) => {
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' ', 'a', 'd', 'w', 's'].includes(e.key)) {
+        e.preventDefault();
+      }
+      keys.add(e.key.toLowerCase());
+      if (player.dead || player.won) {
+        if (e.key.toLowerCase() === 'r') restart();
+      }
+    });
+    document.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+
+    function restart() {
+      const rebuilt = createLevel(baseMap);
+      level = rebuilt.level;
+      spawn = rebuilt.spawn;
+      flag = rebuilt.flag;
+      coins.length = 0;
+      coins.push(...rebuilt.coins);
+      enemies.length = 0;
+      enemies.push(...rebuilt.enemies);
+
+      player.x = spawn.x;
+      player.y = spawn.y;
+      player.vx = 0;
+      player.vy = 0;
+      player.coins = 0;
+      player.dead = false;
+      player.won = false;
+      messageEl.textContent = '';
+    }
+
+    function isSolidTile(tile) {
+      return tile === '#' || tile === 'P' || tile === 'B' || tile === '?';
+    }
+
+    function tileAtPixel(px, py) {
+      const tx = Math.floor(px / TILE);
+      const ty = Math.floor(py / TILE);
+      if (tx < 0 || ty < 0 || ty >= WORLD_HEIGHT || tx >= WORLD_WIDTH) return '#';
+      return level[ty][tx];
+    }
+
+    function setTile(tx, ty, value) {
+      if (tx < 0 || ty < 0 || ty >= WORLD_HEIGHT || tx >= WORLD_WIDTH) return;
+      level[ty][tx] = value;
+    }
+
+    function resolveCollision(entity) {
+      // Horizontal
+      entity.x += entity.vx;
+      const left = Math.floor(entity.x / TILE);
+      const right = Math.floor((entity.x + entity.w) / TILE);
+      const top = Math.floor(entity.y / TILE);
+      const bottom = Math.floor((entity.y + entity.h - 1) / TILE);
+
+      // Horizontal collisions
+      if (entity.vx > 0) {
+        if (isSolidTile(tileAtPixel(entity.x + entity.w, entity.y + 1)) || isSolidTile(tileAtPixel(entity.x + entity.w, entity.y + entity.h - 1))) {
+          entity.x = right * TILE - entity.w - 0.01;
+          entity.vx = 0;
+        }
+      } else if (entity.vx < 0) {
+        if (isSolidTile(tileAtPixel(entity.x, entity.y + 1)) || isSolidTile(tileAtPixel(entity.x, entity.y + entity.h - 1))) {
+          entity.x = (left + 1) * TILE + 0.01;
+          entity.vx = 0;
+        }
+      }
+
+      // Vertical
+      entity.y += entity.vy;
+      const newLeft = Math.floor(entity.x / TILE);
+      const newRight = Math.floor((entity.x + entity.w) / TILE);
+      const newTop = Math.floor(entity.y / TILE);
+      const newBottom = Math.floor((entity.y + entity.h) / TILE);
+      entity.onGround = false;
+
+      if (entity.vy > 0) {
+        // Falling
+        for (let tx = newLeft; tx <= newRight; tx++) {
+          if (isSolidTile(tileAtPixel(tx * TILE + 1, entity.y + entity.h))) {
+            entity.y = newBottom * TILE - entity.h;
+            entity.vy = 0;
+            entity.onGround = true;
+            break;
+          }
+        }
+      } else if (entity.vy < 0) {
+        // Jumping upward, check interactions with blocks
+        for (let tx = newLeft; tx <= newRight; tx++) {
+          const tile = tileAtPixel(tx * TILE + 1, entity.y);
+          if (isSolidTile(tile)) {
+            entity.y = (newTop + 1) * TILE;
+            entity.vy = 0;
+            handleHeadHit(tx, newTop);
+            break;
+          }
+        }
+      }
+    }
+
+    function handleHeadHit(tx, ty) {
+      const tile = tileAtPixel(tx * TILE + 1, ty * TILE + 1);
+      if (tile === '?') {
+        setTile(tx, ty, '.');
+        spawnCoin(tx, ty - 1);
+      } else if (tile === 'B') {
+        setTile(tx, ty, '.');
+      }
+    }
+
+    function spawnCoin(tx, ty) {
+      coins.push({ x: tx * TILE + 4, y: ty * TILE + 4, collected: false, pop: 20 });
+    }
+
+    function updatePlayer() {
+      if (player.dead || player.won) return;
+      const leftPressed = keys.has('arrowleft') || keys.has('a');
+      const rightPressed = keys.has('arrowright') || keys.has('d');
+      const jumpPressed = keys.has(' ') || keys.has('arrowup') || keys.has('w');
+
+      if (leftPressed) player.vx = Math.max(player.vx - ACCEL, -MAX_RUN);
+      if (rightPressed) player.vx = Math.min(player.vx + ACCEL, MAX_RUN);
+      if (!leftPressed && !rightPressed) player.vx *= FRICTION;
+
+      if (jumpPressed && player.onGround) {
+        player.vy = JUMP_VELOCITY;
+        player.onGround = false;
+      }
+
+      player.vy += GRAVITY;
+      if (player.vy > 12) player.vy = 12;
+
+      resolveCollision(player);
+      checkCoinPickup();
+      checkEnemyInteraction();
+      checkFlag();
+
+      if (player.y > canvas.height) {
+        triggerDeath();
+      }
+    }
+
+    function triggerDeath() {
+      player.dead = true;
+      messageEl.textContent = 'Ouch! Press R to retry.';
+    }
+
+    function checkCoinPickup() {
+      for (const coin of coins) {
+        if (coin.collected) continue;
+        const dx = (player.x + player.w / 2) - (coin.x + 4);
+        const dy = (player.y + player.h / 2) - (coin.y + 4);
+        if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+          coin.collected = true;
+          player.coins += 1;
+        }
+        if (coin.pop) {
+          coin.pop -= 1;
+          coin.y -= 1;
+          if (coin.pop <= 0) coin.collected = true;
+        }
+      }
+      statusEl.textContent = `Coins: ${player.coins}`;
+    }
+
+    function checkEnemyInteraction() {
+      for (const enemy of enemies) {
+        if (!enemy.alive) continue;
+        enemy.vy += GRAVITY;
+        enemy.x += enemy.vx;
+        resolveEnemyCollision(enemy);
+
+        if (aabbOverlap(player, enemy)) {
+          if (player.vy > 0) {
+            enemy.alive = false;
+            player.vy = JUMP_VELOCITY * 0.7;
+          } else {
+            triggerDeath();
+          }
+        }
+      }
+    }
+
+    function resolveEnemyCollision(enemy) {
+      // Horizontal against walls and edges
+      const aheadX = enemy.vx > 0 ? enemy.x + enemy.w + 1 : enemy.x - 1;
+      const aheadY = enemy.y + enemy.h - 1;
+      const tileAhead = tileAtPixel(aheadX, aheadY);
+      const tileBelowAhead = tileAtPixel(aheadX, enemy.y + enemy.h + 1);
+      if (isSolidTile(tileAhead) || !isSolidTile(tileBelowAhead)) {
+        enemy.vx *= -1;
+      }
+
+      // Apply gravity and floor collision
+      enemy.y += enemy.vy;
+      const left = Math.floor(enemy.x / TILE);
+      const right = Math.floor((enemy.x + enemy.w) / TILE);
+      const bottom = Math.floor((enemy.y + enemy.h) / TILE);
+      for (let tx = left; tx <= right; tx++) {
+        if (isSolidTile(tileAtPixel(tx * TILE + 1, enemy.y + enemy.h))) {
+          enemy.y = bottom * TILE - enemy.h;
+          enemy.vy = 0;
+          break;
+        }
+      }
+    }
+
+    function aabbOverlap(a, b) {
+      return (
+        a.x < b.x + b.w &&
+        a.x + a.w > b.x &&
+        a.y < b.y + b.h &&
+        a.y + a.h > b.y
+      );
+    }
+
+    function checkFlag() {
+      if (!flag) return;
+      const flagBox = { x: flag.x, y: flag.y, w: TILE, h: TILE * 5 };
+      if (aabbOverlap(player, flagBox)) {
+        player.won = true;
+        messageEl.textContent = 'You reached the flag! Press R to play again.';
+      }
+    }
+
+    function updateCamera() {
+      const targetX = player.x - canvas.width / 2 + player.w / 2;
+      camera.x += (targetX - camera.x) * 0.08;
+      camera.x = Math.max(0, Math.min(camera.x, WORLD_WIDTH * TILE - canvas.width));
+      camera.y = 0;
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.translate(-camera.x, -camera.y);
+
+      drawBackground();
+      drawTiles();
+      drawCoins();
+      drawEnemies();
+      drawPlayer();
+      drawFlag();
+
+      ctx.restore();
+    }
+
+    function drawBackground() {
+      ctx.fillStyle = '#0c0c12';
+      ctx.fillRect(camera.x, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#111118';
+      for (let i = 0; i < 20; i++) {
+        ctx.fillRect(camera.x + i * 160, 40 + (i % 3) * 6, 40, 2);
+      }
+    }
+
+    function drawTiles() {
+      const startX = Math.floor(camera.x / TILE);
+      const endX = Math.ceil((camera.x + canvas.width) / TILE);
+      for (let y = 0; y < level.length; y++) {
+        for (let x = startX; x < endX; x++) {
+          const tile = level[y][x];
+          if (tile === '.') continue;
+          const px = x * TILE;
+          const py = y * TILE;
+          switch (tile) {
+            case '#':
+              ctx.fillStyle = '#3a3a4a';
+              ctx.fillRect(px, py, TILE, TILE);
+              ctx.fillStyle = '#565674';
+              ctx.fillRect(px + 2, py + 2, TILE - 4, TILE - 4);
+              break;
+            case 'P':
+              ctx.fillStyle = '#2c8a4b';
+              ctx.fillRect(px, py, TILE, TILE);
+              ctx.fillStyle = '#44b86b';
+              ctx.fillRect(px + 3, py + 3, TILE - 6, TILE - 6);
+              break;
+            case '?':
+              ctx.fillStyle = '#d4a31c';
+              ctx.fillRect(px, py, TILE, TILE);
+              ctx.fillStyle = '#f7ce46';
+              ctx.fillRect(px + 3, py + 3, TILE - 6, TILE - 6);
+              ctx.fillStyle = '#b07f12';
+              ctx.fillText('?', px + 5, py + 12);
+              break;
+            case 'B':
+              ctx.fillStyle = '#7b3f1f';
+              ctx.fillRect(px, py, TILE, TILE);
+              ctx.fillStyle = '#9a5a32';
+              ctx.fillRect(px + 2, py + 2, TILE - 4, TILE - 4);
+              break;
+          }
+        }
+      }
+    }
+
+    function drawCoins() {
+      ctx.fillStyle = '#f5d94e';
+      for (const coin of coins) {
+        if (coin.collected) continue;
+        ctx.beginPath();
+        ctx.arc(coin.x + 4, coin.y + 4, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawEnemies() {
+      ctx.fillStyle = '#c2574a';
+      for (const enemy of enemies) {
+        if (!enemy.alive) continue;
+        ctx.fillRect(enemy.x, enemy.y, enemy.w, enemy.h);
+        ctx.fillStyle = '#e88c7f';
+        ctx.fillRect(enemy.x + 2, enemy.y + 4, enemy.w - 4, enemy.h - 6);
+        ctx.fillStyle = '#c2574a';
+      }
+    }
+
+    function drawPlayer() {
+      ctx.fillStyle = '#4da6ff';
+      ctx.fillRect(player.x, player.y, player.w, player.h);
+      ctx.fillStyle = '#93c8ff';
+      ctx.fillRect(player.x + 2, player.y + 2, player.w - 4, player.h - 6);
+    }
+
+    function drawFlag() {
+      if (!flag) return;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(flag.x + TILE / 2 - 2, flag.y, 4, TILE * 5);
+      ctx.fillStyle = '#4ade80';
+      ctx.beginPath();
+      ctx.moveTo(flag.x + TILE / 2 + 2, flag.y);
+      ctx.lineTo(flag.x + TILE / 2 + 2 + 14, flag.y + 6);
+      ctx.lineTo(flag.x + TILE / 2 + 2, flag.y + 12);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    function gameLoop() {
+      updatePlayer();
+      updateCamera();
+      draw();
+      requestAnimationFrame(gameLoop);
+    }
+
+    gameLoop();
+  </script>
+</body>
+</html>
